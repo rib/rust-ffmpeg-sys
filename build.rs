@@ -117,13 +117,17 @@ fn search() -> PathBuf {
 }
 
 fn fetch() -> io::Result<()> {
+    let output_base_path = output();
+    let clone_dest_dir = format!("ffmpeg-{}", version());
+    let _ = std::fs::remove_dir_all(output_base_path.join(&clone_dest_dir));
     let status = Command::new("git")
-            .current_dir(&output())
+            .current_dir(&output_base_path)
             .arg("clone")
+            .arg("--depth=1")
             .arg("-b")
             .arg(format!("release/{}", version()))
             .arg("https://github.com/FFmpeg/FFmpeg")
-            .arg(format!("ffmpeg-{}", version()))
+            .arg(&clone_dest_dir)
             .status()?;
 
     if status.success() {
@@ -144,8 +148,14 @@ fn switch(configure: &mut Command, feature: &str, name: &str) {
 }
 
 fn build() -> io::Result<()> {
-    let mut configure = Command::new("./configure");
-    configure.current_dir(&source());
+    let source_dir = source();
+
+    // Command's path is not relative to command's current_dir
+    let configure_path = source_dir.join("configure");
+    assert!(configure_path.exists());
+    let mut configure = Command::new(&configure_path);
+    configure.current_dir(&source_dir);
+
     configure.arg(format!("--prefix={}", search().to_string_lossy()));
 
     if env::var("TARGET").unwrap() != env::var("HOST").unwrap() {
@@ -166,6 +176,9 @@ fn build() -> io::Result<()> {
     configure.arg("--disable-shared");
 
     configure.arg("--enable-pic");
+
+    // stop autodetected libraries enabling themselves, causing linking errors
+    configure.arg("--disable-autodetect");
 
     // do not build programs since we don't need them
     configure.arg("--disable-programs");
