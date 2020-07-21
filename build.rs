@@ -159,7 +159,19 @@ fn build() -> io::Result<()> {
     configure.arg(format!("--prefix={}", search().to_string_lossy()));
 
     if env::var("TARGET").unwrap() != env::var("HOST").unwrap() {
-        configure.arg(format!("--cross-prefix={}-", env::var("TARGET").unwrap()));
+        // Rust targets are subtly different than naming scheme for compiler prefixes.
+        // The cc crate has the messy logic of guessing a working prefix,
+        // and this is a messy way of reusing that logic.
+        let cc = cc::Build::new();
+        let compiler = cc.get_compiler();
+        let compiler = compiler.path()
+            .file_stem().unwrap().to_str().unwrap();
+        let suffix_pos = compiler.rfind('-').unwrap(); // cut off "-gcc"
+        let prefix = compiler[0..suffix_pos].trim_end_matches("-wr"); // "wr-c++" compiler
+
+        configure.arg(format!("--cross-prefix={}-", prefix));
+        configure.arg(format!("--arch={}", env::var("CARGO_CFG_TARGET_ARCH").unwrap()));
+        configure.arg(format!("--target_os={}", env::var("CARGO_CFG_TARGET_OS").unwrap()));
     }
 
     // control debug build
@@ -336,19 +348,21 @@ fn check_features(
         }
         includes_code.push_str(&format!(
             r#"
+            #ifndef {var}_is_defined
             #ifndef {var}
             #define {var} 0
             #define {var}_is_defined 0
             #else
             #define {var}_is_defined 1
             #endif
+            #endif
         "#,
             var = var
         ));
 
         main_code.push_str(&format!(
-            r#"printf("[{var}]%d%d\n", {var}, {var}_is_defined);"#,
-            var = var
+            r#"printf("[{var}]%d%d\n", {var}, {var}_is_defined);
+            "#, var = var
         ));
     }
 
@@ -359,8 +373,8 @@ fn check_features(
         for version_major in begin_version_major..end_version_major {
             for version_minor in begin_version_minor..end_version_minor {
                 main_code.push_str(&format!(
-                    r#"printf("[{lib}_version_greater_than_{version_major}_{version_minor}]%d\n", LIB{lib_uppercase}_VERSION_MAJOR > {version_major} || (LIB{lib_uppercase}_VERSION_MAJOR == {version_major} && LIB{lib_uppercase}_VERSION_MINOR > {version_minor}));"#,
-                    lib = lib,
+                    r#"printf("[{lib}_version_greater_than_{version_major}_{version_minor}]%d\n", LIB{lib_uppercase}_VERSION_MAJOR > {version_major} || (LIB{lib_uppercase}_VERSION_MAJOR == {version_major} && LIB{lib_uppercase}_VERSION_MINOR > {version_minor}));
+                    "#, lib = lib,
                     lib_uppercase = lib.to_uppercase(),
                     version_major = version_major,
                     version_minor = version_minor
@@ -388,7 +402,9 @@ fn check_features(
     ).expect("Write failed");
 
     let executable = out_dir.join(if cfg!(windows) { "check.exe" } else { "check" });
-    let mut compiler = cc::Build::new().get_compiler().to_command();
+    let mut compiler = cc::Build::new()
+        .target(&env::var("HOST").unwrap()) // don't cross-compile this
+        .get_compiler().to_command();
 
     for dir in include_paths {
         compiler.arg("-I");
@@ -406,14 +422,17 @@ fn check_features(
         panic!("Compile failed");
     }
 
-    let stdout_raw = Command::new(out_dir.join(&executable))
+    let check_output = Command::new(out_dir.join(&executable))
         .current_dir(&out_dir)
         .output()
-        .expect("Check failed")
-        .stdout;
-    let stdout = str::from_utf8(stdout_raw.as_slice()).unwrap();
+        .expect("Check failed");
+    if !check_output.status.success() {
+        panic!("{} failed: {}\n{}", executable.display(), String::from_utf8_lossy(&check_output.stdout), String::from_utf8_lossy(&check_output.stderr));
+    }
 
-    println!("stdout={}", stdout);
+    let stdout = str::from_utf8(&check_output.stdout).unwrap();
+
+    println!("stdout of {}={}", executable.display(), stdout);
 
     for &(_, feature, var) in infos {
         if let Some(feature) = feature {
@@ -423,7 +442,8 @@ fn check_features(
         }
 
         let var_str = format!("[{var}]", var = var);
-        let pos = stdout.find(&var_str).expect("Variable not found in output") + var_str.len();
+        let pos = var_str.len() + stdout.find(&var_str)
+            .unwrap_or_else(|| panic!("Variable '{}' not found in stdout output", var_str));
         if &stdout[pos..pos + 1] == "1" {
             println!(r#"cargo:rustc-cfg=feature="{}""#, var.to_lowercase());
             println!(r#"cargo:{}=true"#, var.to_lowercase());
